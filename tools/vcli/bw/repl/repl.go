@@ -22,6 +22,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
+	"runtime/pprof"
+	"strconv"
 	"strings"
 	"time"
 
@@ -88,10 +91,47 @@ func SimpleReadLine(done chan bool) <-chan string {
 	return c
 }
 
+// startProfiling tries to start pprof profiling, returning the two files to which the profiling metrics will be printed.
+func startProfiling() (*os.File, *os.File, error) {
+	cpuProfile, err := os.Create("cpuprofile")
+	if err != nil {
+		return nil, nil, err
+	}
+	memProfile, err := os.Create("memprofile")
+	if err != nil {
+		return nil, nil, err
+	}
+
+	err = pprof.StartCPUProfile(cpuProfile)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return cpuProfile, memProfile, nil
+}
+
+// stopProfiling stops pprof profiling, writing the final profiling metrics to the correspondent files and closing them.
+func stopProfiling(cpuProfile, memProfile *os.File) {
+	if cpuProfile == nil || memProfile == nil {
+		fmt.Println("cpuProfile and memProfile must be both non-nil to stop profiling.")
+		return
+	}
+
+	pprof.StopCPUProfile()
+	err := pprof.WriteHeapProfile(memProfile)
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	cpuProfile.Close()
+	memProfile.Close()
+}
+
 // REPL starts a read-evaluation-print-loop to run BQL commands.
 func REPL(od storage.Store, input *os.File, rl ReadLiner, chanSize, bulkSize, builderSize int, done chan bool) int {
-	var tracer io.Writer
-	ctx, isTracingToFile, sessionStart := context.Background(), false, time.Now()
+	var traceWriter io.Writer
+	ctx, isTracingToFile, isProfiling, sessionStart := context.Background(), false, false, time.Now()
+	var cpuProfile, memProfile *os.File
 
 	driverPlain := func() storage.Store {
 		return od
@@ -104,12 +144,12 @@ func REPL(od storage.Store, input *os.File, rl ReadLiner, chanSize, bulkSize, bu
 	driver := driverWithMemoization
 
 	stopTracing := func() {
-		if tracer != nil {
+		if traceWriter != nil {
 			if isTracingToFile {
 				fmt.Println("Closing tracing file.")
-				tracer.(*os.File).Close()
+				traceWriter.(*os.File).Close()
 			}
-			tracer, isTracingToFile = nil, false
+			traceWriter, isTracingToFile = nil, false
 		}
 	}
 	defer stopTracing()
@@ -125,6 +165,11 @@ func REPL(od storage.Store, input *os.File, rl ReadLiner, chanSize, bulkSize, bu
 
 	for l := range rl(done) {
 		if strings.HasPrefix(l, "quit") {
+			if isProfiling {
+				fmt.Println("Stopping profiling and closing correspondent files.")
+				stopProfiling(cpuProfile, memProfile)
+				isProfiling = false
+			}
 			done <- true
 			break
 		}
@@ -151,20 +196,61 @@ func REPL(od storage.Store, input *os.File, rl ReadLiner, chanSize, bulkSize, bu
 			case 2:
 				// Start tracing to the console.
 				stopTracing()
-				tracer, isTracingToFile = os.Stdout, false
-				fmt.Println("[WARNING] Tracing is on. This may slow your BQL queries.")
+				traceWriter, isTracingToFile = os.Stdout, false
+				tracer.SetVerbosity(1)
+				fmt.Println("[WARNING] Tracing is on. This may slow your BQL queries.\nDefault verbosity level set to 1 (minimum).")
 			case 3:
 				// Start tracing to file.
 				stopTracing()
 				f, err := os.Create(args[2])
 				if err != nil {
 					fmt.Println(err)
-				} else {
-					tracer, isTracingToFile = f, true
-					fmt.Println("[WARNING] Tracing is on. This may slow your BQL queries.")
+					fmt.Println("Tracing failed to start.")
+					break
 				}
+				traceWriter, isTracingToFile = f, true
+				tracer.SetVerbosity(1)
+				fmt.Printf("[WARNING] Tracing to %q is on. This may slow your BQL queries.\nDefault verbosity level set to 1 (minimum).\n", f.Name())
+			case 4:
+				// Start tracing to the console with specified verbosity level.
+				stopTracing()
+				if args[2] != "-v" {
+					fmt.Printf("Invalid syntax with %q.\n\tstart tracing [-v verbosity_level] [trace_file]\n", args[2])
+					break
+				}
+				verbosity, err := strconv.ParseInt(args[3], 10, 32)
+				if err != nil {
+					fmt.Println(err)
+					fmt.Println("Tracing failed to start.")
+					break
+				}
+				traceWriter, isTracingToFile = os.Stdout, false
+				verbositySet := tracer.SetVerbosity(int(verbosity))
+				fmt.Printf("[WARNING] Tracing is on. This may slow your BQL queries.\nVerbosity level set to %d.\n", verbositySet)
+			case 5:
+				// Start tracing to file with specified verbosity level.
+				stopTracing()
+				if args[2] != "-v" {
+					fmt.Printf("Invalid syntax with %q.\n\tstart tracing [-v verbosity_level] [trace_file]\n", args[2])
+					break
+				}
+				verbosity, err := strconv.ParseInt(args[3], 10, 32)
+				if err != nil {
+					fmt.Println(err)
+					fmt.Println("Tracing failed to start.")
+					break
+				}
+				f, err := os.Create(args[4])
+				if err != nil {
+					fmt.Println(err)
+					fmt.Println("Tracing failed to start.")
+					break
+				}
+				traceWriter, isTracingToFile = f, true
+				verbositySet := tracer.SetVerbosity(int(verbosity))
+				fmt.Printf("[WARNING] Tracing to %q is on. This may slow your BQL queries.\nVerbosity level set to %d.\n", f.Name(), verbositySet)
 			default:
-				fmt.Println("Invalid syntax\n\tstart tracing [trace_file]")
+				fmt.Println("Invalid syntax.\n\tstart tracing [-v verbosity_level] [trace_file]")
 			}
 			done <- false
 			continue
@@ -172,6 +258,61 @@ func REPL(od storage.Store, input *os.File, rl ReadLiner, chanSize, bulkSize, bu
 		if strings.HasPrefix(l, "stop tracing") {
 			stopTracing()
 			fmt.Println("Tracing is off.")
+			done <- false
+			continue
+		}
+		if strings.HasPrefix(l, "start profiling") {
+			if isProfiling {
+				fmt.Println("Profiling is already ongoing.")
+				done <- false
+				continue
+			}
+			args := strings.Split(strings.TrimSpace(l)[:len(l)-1], " ")
+			var err error
+			switch len(args) {
+			case 2:
+				cpuProfile, memProfile, err = startProfiling()
+				if err != nil {
+					fmt.Println(err)
+					fmt.Println("Profiling failed to start.")
+					break
+				}
+				isProfiling = true
+				fmt.Println("Profiling with pprof is on.")
+			case 4:
+				if args[2] != "-cpurate" {
+					fmt.Printf("Invalid syntax with %q.\n\tstart profiling [-cpurate samples_per_second]\n", args[2])
+					break
+				}
+				cpuProfRate, err := strconv.ParseInt(args[3], 10, 32)
+				if err != nil {
+					fmt.Println(err)
+					fmt.Println("Profiling failed to start.")
+					break
+				}
+				runtime.SetCPUProfileRate(int(cpuProfRate))
+				cpuProfile, memProfile, err = startProfiling()
+				if err != nil {
+					fmt.Println(err)
+					fmt.Println("Profiling failed to start.")
+					break
+				}
+				isProfiling = true
+				fmt.Printf("Profiling with pprof is on (CPU profiling rate: %d samples per second).\n", cpuProfRate)
+			default:
+				fmt.Println("Invalid syntax.\n\tstart profiling [-cpurate samples_per_second]")
+			}
+			done <- false
+			continue
+		}
+		if strings.HasPrefix(l, "stop profiling") {
+			if isProfiling {
+				stopProfiling(cpuProfile, memProfile)
+				isProfiling = false
+				fmt.Println("Profiling with pprof is turned off.")
+			} else {
+				fmt.Println("Profiling with pprof is already off.")
+			}
 			done <- false
 			continue
 		}
@@ -208,7 +349,7 @@ func REPL(od storage.Store, input *os.File, rl ReadLiner, chanSize, bulkSize, bu
 		}
 		if strings.HasPrefix(l, "run") {
 			now := time.Now()
-			path, cmds, err := runBQLFromFile(ctx, driver(), chanSize, bulkSize, strings.TrimSpace(l[:len(l)-1]), tracer)
+			path, cmds, err := runBQLFromFile(ctx, driver(), chanSize, bulkSize, strings.TrimSpace(l[:len(l)-1]), traceWriter)
 			if err != nil {
 				fmt.Printf("[ERROR] %s\n\n", err)
 			} else {
@@ -220,7 +361,7 @@ func REPL(od storage.Store, input *os.File, rl ReadLiner, chanSize, bulkSize, bu
 		}
 
 		now := time.Now()
-		table, err := runBQL(ctx, l, driver(), chanSize, bulkSize, tracer)
+		table, err := runBQL(ctx, l, driver(), chanSize, bulkSize, traceWriter)
 		bqlDiff := time.Now().Sub(now)
 		if err != nil {
 			fmt.Printf("[ERROR] %s\n", err)
@@ -253,8 +394,10 @@ func printHelp() {
 	fmt.Println("desc <BQL>                                            - prints the execution plan for a BQL statement.")
 	fmt.Println("load <file_path> <graph_names_separated_by_commas>    - load triples into the specified graphs.")
 	fmt.Println("run <file_with_bql_statements>                        - runs all the BQL statements in the file.")
-	fmt.Println("start tracing [trace_file]                            - starts tracing queries.")
+	fmt.Println("start tracing [-v verbosity_level] [trace_file]       - starts tracing queries, verbosity levels supported are 1, 2 and 3 (with 3 meaning maximum verbosity).")
 	fmt.Println("stop tracing                                          - stops tracing queries.")
+	fmt.Println("start profiling [-cpurate samples_per_second]         - starts pprof profiling for queries (customizable CPU sampling rate).")
+	fmt.Println("stop profiling                                        - stops pprof profiling for queries.")
 	fmt.Println("quit                                                  - quits the console.")
 	fmt.Println()
 }
@@ -266,7 +409,7 @@ func runBQLFromFile(ctx context.Context, driver storage.Store, chanSize, bulkSiz
 		return "", 0, fmt.Errorf("wrong syntax: run <file_with_bql_statements>")
 	}
 	path := ss[1]
-	tracer.Trace(w, func() *tracer.Arguments {
+	tracer.V(1).Trace(w, func() *tracer.Arguments {
 		return &tracer.Arguments{
 			Msgs: []string{fmt.Sprintf("Attempting to read file %q", path)},
 		}
@@ -274,7 +417,7 @@ func runBQLFromFile(ctx context.Context, driver storage.Store, chanSize, bulkSiz
 	lines, err := bio.GetStatementsFromFile(path)
 	if err != nil {
 		msg := fmt.Errorf("failed to read file %q; error %v", path, err)
-		tracer.Trace(w, func() *tracer.Arguments {
+		tracer.V(1).Trace(w, func() *tracer.Arguments {
 			return &tracer.Arguments{
 				Msgs: []string{msg.Error()},
 			}
@@ -286,7 +429,7 @@ func runBQLFromFile(ctx context.Context, driver storage.Store, chanSize, bulkSiz
 		_, err := runBQL(ctx, stm, driver, chanSize, bulkSize, w)
 		if err != nil {
 			msg := fmt.Errorf("%q; %v", stm, err)
-			tracer.Trace(w, func() *tracer.Arguments {
+			tracer.V(1).Trace(w, func() *tracer.Arguments {
 				return &tracer.Arguments{
 					Msgs: []string{msg.Error()},
 				}
@@ -300,7 +443,7 @@ func runBQLFromFile(ctx context.Context, driver storage.Store, chanSize, bulkSiz
 
 // runBQL attempts to execute the provided query against the given store.
 func runBQL(ctx context.Context, bql string, s storage.Store, chanSize, bulkSize int, w io.Writer) (*table.Table, error) {
-	tracer.Trace(w, func() *tracer.Arguments {
+	tracer.V(1).Trace(w, func() *tracer.Arguments {
 		return &tracer.Arguments{
 			Msgs: []string{fmt.Sprintf("Executing query: %s", bql)},
 		}
@@ -315,16 +458,17 @@ func runBQL(ctx context.Context, bql string, s storage.Store, chanSize, bulkSize
 	res, err := pln.Execute(ctx)
 	if err != nil {
 		msg := fmt.Errorf("planner.Execute: failed to execute; %v", err)
-		tracer.Trace(w, func() *tracer.Arguments {
+		tracer.V(1).Trace(w, func() *tracer.Arguments {
 			return &tracer.Arguments{
 				Msgs: []string{msg.Error()},
 			}
 		})
 		return nil, msg
 	}
-	tracer.Trace(w, func() *tracer.Arguments {
+	nRows := res.NumRows()
+	tracer.V(1).Trace(w, func() *tracer.Arguments {
 		return &tracer.Arguments{
-			Msgs: []string{fmt.Sprintf("planner execute returned %d rows", res.NumRows())},
+			Msgs: []string{fmt.Sprintf("Executed plan returned %d rows", nRows)},
 		}
 	})
 	return res, nil
@@ -334,7 +478,7 @@ func runBQL(ctx context.Context, bql string, s storage.Store, chanSize, bulkSize
 func planBQL(ctx context.Context, bql string, s storage.Store, chanSize, bulkSize int, w io.Writer) (planner.Executor, error) {
 	bql = strings.TrimSpace(bql)
 	if bql == ";" {
-		tracer.Trace(w, func() *tracer.Arguments {
+		tracer.V(1).Trace(w, func() *tracer.Arguments {
 			return &tracer.Arguments{
 				Msgs: []string{"Empty statement found"},
 			}
@@ -344,7 +488,7 @@ func planBQL(ctx context.Context, bql string, s storage.Store, chanSize, bulkSiz
 	p, err := grammar.NewParser(grammar.SemanticBQL())
 	if err != nil {
 		msg := fmt.Errorf("NewParser failed; %v", err)
-		tracer.Trace(w, func() *tracer.Arguments {
+		tracer.V(1).Trace(w, func() *tracer.Arguments {
 			return &tracer.Arguments{
 				Msgs: []string{msg.Error()},
 			}
@@ -354,7 +498,7 @@ func planBQL(ctx context.Context, bql string, s storage.Store, chanSize, bulkSiz
 	stm := &semantic.Statement{}
 	if err := p.Parse(grammar.NewLLk(bql, 1), stm); err != nil {
 		msg := fmt.Errorf("NewLLk parser failed; %v", err)
-		tracer.Trace(w, func() *tracer.Arguments {
+		tracer.V(1).Trace(w, func() *tracer.Arguments {
 			return &tracer.Arguments{
 				Msgs: []string{msg.Error()},
 			}
@@ -363,15 +507,15 @@ func planBQL(ctx context.Context, bql string, s storage.Store, chanSize, bulkSiz
 	}
 	pln, err := planner.New(ctx, s, stm, chanSize, bulkSize, w)
 	if err != nil {
-		msg := fmt.Errorf("planer.New failed failed; %v", err)
-		tracer.Trace(w, func() *tracer.Arguments {
+		msg := fmt.Errorf("planner.New failed with error: %v", err)
+		tracer.V(1).Trace(w, func() *tracer.Arguments {
 			return &tracer.Arguments{
 				Msgs: []string{msg.Error()},
 			}
 		})
 		return nil, msg
 	}
-	tracer.Trace(w, func() *tracer.Arguments {
+	tracer.V(1).Trace(w, func() *tracer.Arguments {
 		return &tracer.Arguments{
 			Msgs: []string{"Plan successfully created"},
 		}
